@@ -56,6 +56,24 @@ function pickFirst(formAnswers, keys = []) {
  * body.payload has invitee info directly: name, email, questions_and_answers...
  * body.payload.scheduled_event has event info including event_type (URL).
  */
+function normalizeMobile(input) {
+    if (!input) return '';
+
+    // keep digits only
+    let digits = String(input).replace(/\D/g, '');
+
+    // If it looks like India number with country code (91 + 10 digits)
+    if (digits.length === 12 && digits.startsWith('91')) return digits;
+
+    // If it's already 10 digits
+    if (digits.length === 10) return digits;
+
+    // Otherwise fallback: last 10 digits
+    if (digits.length > 10) return digits.slice(-10);
+
+    return digits; // may still fail but at least clean
+}
+
 function normalizeCalendlyWebhook(body) {
     const event = body?.event;
     const payload = body?.payload;
@@ -163,10 +181,12 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         // invitee fields (from payload)
         const fullName = invitee.name || 'Unknown';
         const email = invitee.email || '';
-        const mobile =
-            (questionsAnswers.find(q => (q.question || '').toLowerCase().includes('mobile'))?.answer || '')
-                .replace(/\s+/g, ' ')
-                .trim();
+        const rawMobile =
+            questionsAnswers.find(q => (q.question || '').toLowerCase().includes('mobile'))?.answer || '';
+
+        const mobile = normalizeMobile(rawMobile);
+
+        console.log(`[${requestId}] Mobile raw="${rawMobile}" normalized="${mobile}"`);
 
         console.log(`[${requestId}] Invitee parsed: name="${fullName}", email="${email}", mobile="${mobile}"`);
 
