@@ -1,16 +1,30 @@
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+
+/**
+ * IMPORTANT:
+ * For Calendly signature verification we need the RAW BODY.
+ * So we add express.raw() on the webhook route only.
+ * For other routes we can keep express.json().
+ */
+app.use((req, res, next) => {
+    // Only parse JSON normally for non-webhook routes
+    if (req.path === '/api/webhook') return next();
+    return express.json()(req, res, next);
+});
 
 const TELEFORCE_API_URL = process.env.TELEFORCE_API_URL;
 const ACCOUNT_ID = process.env.TELEFORCE_ACCOUNT_ID;
 const CALENDLY_TOKEN = process.env.CALENDLY_ACCESS_TOKEN;
+const CALENDLY_WEBHOOK_SIGNING_KEY = process.env.CALENDLY_WEBHOOK_SIGNING_KEY; // from developer console
+const ENABLE_SIGNATURE_VERIFY = (process.env.CALENDLY_VERIFY_SIGNATURE || 'false').toLowerCase() === 'true';
 
 // ============================================
-// SEGMENT MAPPING
+// SEGMENT MAPPING (event name -> teleforce segment id)
 // ============================================
 const SEGMENT_MAPPING = {
     'CRO': 'SEG07ootjebf6hm231767941287541',
@@ -44,159 +58,295 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================
-// WEBHOOK ENDPOINT
+// HELPERS
 // ============================================
-app.post('/api/webhook', async (req, res) => {
+function safeJsonParse(buf) {
     try {
-        const { event, data } = req.body;
+        return JSON.parse(buf.toString('utf8'));
+    } catch (e) {
+        return null;
+    }
+}
 
-        console.log(`\n📨 Webhook received: ${event}`);
+/**
+ * Calendly signature verification.
+ * Header format: "t=timestamp,v1=signature"
+ * Signature = HMAC-SHA256(signing_key, `${t}.${rawBody}`)
+ */
+function verifyCalendlySignature(rawBody, signatureHeader, signingKey) {
+    if (!signatureHeader || !signingKey) return false;
+
+    const parts = signatureHeader.split(',');
+    const tPart = parts.find(p => p.trim().startsWith('t='));
+    const v1Part = parts.find(p => p.trim().startsWith('v1='));
+    if (!tPart || !v1Part) return false;
+
+    const t = tPart.split('=')[1];
+    const sig = v1Part.split('=')[1];
+
+    const payloadToSign = `${t}.${rawBody}`;
+    const expected = crypto
+        .createHmac('sha256', signingKey)
+        .update(payloadToSign, 'utf8')
+        .digest('hex');
+
+    // timing-safe compare
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(sig, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Calendly real webhook shape is usually:
+ * { event: "invitee.created", payload: { invitee: {...}, event: {...}, questions_and_answers: [...] } }
+ *
+ * Your old tests used:
+ * { event: "invitee.created", data: { invitee: {...}, event: {...}, payload: { questions_and_answers: [...] } } }
+ */
+function normalizeCalendlyWebhook(body) {
+    const event = body?.event;
+
+    // Prefer "payload" (real Calendly)
+    const payload = body?.payload;
+
+    // fallback to "data" (your test)
+    const data = body?.data;
+
+    // Try to locate invitee/event data from either
+    const invitee = payload?.invitee || data?.invitee;
+    const eventData = payload?.event || data?.event;
+
+    // Questions & answers can be in different places
+    const questionsAnswers =
+        payload?.questions_and_answers ||
+        payload?.questions_and_answers?.collection ||
+        data?.payload?.questions_and_answers ||
+        [];
+
+    return { event, invitee, eventData, questionsAnswers, raw: body };
+}
+
+function pickFirst(formAnswers, keys = []) {
+    for (const k of keys) {
+        if (formAnswers[k] !== undefined && formAnswers[k] !== null && String(formAnswers[k]).trim() !== '') {
+            return formAnswers[k];
+        }
+    }
+    return '';
+}
+
+// ============================================
+// WEBHOOK ENDPOINT (RAW BODY + DEBUG)
+// ============================================
+app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+    const requestId = crypto.randomUUID();
+
+    try {
+        const rawBody = req.body?.toString('utf8') || '';
+        const signatureHeader =
+            req.headers['calendly-webhook-signature'] ||
+            req.headers['Calendly-Webhook-Signature'];
+
+        console.log(`\n==================== [${requestId}] WEBHOOK HIT ====================`);
+        console.log(`[${requestId}] Time: ${new Date().toISOString()}`);
+        console.log(`[${requestId}] Headers:`, {
+            'content-type': req.headers['content-type'],
+            'user-agent': req.headers['user-agent'],
+            'calendly-webhook-signature': signatureHeader ? '(present)' : '(missing)'
+        });
+        console.log(`[${requestId}] Raw body length: ${rawBody.length}`);
+
+        const body = safeJsonParse(req.body);
+        if (!body) {
+            console.log(`[${requestId}] ❌ Body is not valid JSON`);
+            return res.status(400).json({ success: false, error: 'Invalid JSON body' });
+        }
+
+        console.log(`[${requestId}] Parsed body keys:`, Object.keys(body));
+        console.log(`[${requestId}] Parsed body preview:`, JSON.stringify(body, null, 2).slice(0, 2500));
+
+        // Optional signature check (recommended on prod)
+        if (ENABLE_SIGNATURE_VERIFY) {
+            const ok = verifyCalendlySignature(rawBody, signatureHeader, CALENDLY_WEBHOOK_SIGNING_KEY);
+            console.log(`[${requestId}] Signature verification: ${ok ? '✅ OK' : '❌ FAILED'}`);
+            if (!ok) return res.status(401).json({ success: false, error: 'Invalid webhook signature' });
+        } else {
+            console.log(`[${requestId}] Signature verification: SKIPPED (set CALENDLY_VERIFY_SIGNATURE=true to enable)`);
+        }
+
+        const { event, invitee, eventData, questionsAnswers } = normalizeCalendlyWebhook(body);
+
+        console.log(`[${requestId}] Event type: ${event}`);
 
         if (event !== 'invitee.created') {
+            console.log(`[${requestId}] Ignoring event type: ${event}`);
             return res.status(200).json({ message: 'Event ignored' });
         }
 
-        const invitee = data.invitee;
-        const eventData = data.event;
-        const questionsAnswers = data.payload?.questions_and_answers || [];
-
-        // Get segment from event name
-        const eventTitle = eventData.name;
-        const segmentId = SEGMENT_MAPPING[eventTitle];
-
-        console.log(`📋 Event: ${eventTitle}`);
-        console.log(`📊 Segment ID: ${segmentId || 'NOT FOUND'}`);
-
-        // Parse form answers
-        const formAnswers = {};
-        questionsAnswers.forEach((qa) => {
-            formAnswers[qa.question] = qa.answer;
-        });
-
-        const fullName = invitee.name || 'Unknown';
-        const email = invitee.email || '';
-        const mobile = invitee.text_reminder_number || '';
-
-        const formConfig = FORM_MAPPINGS[eventTitle];
-        let city = '';
-        let address = '';
-
-        if (formConfig) {
-            city = formAnswers[formConfig.standardFields.city[0]] ||
-                formAnswers[formConfig.standardFields.city[1]] || '';
-            address = formAnswers[formConfig.standardFields.address[0]] ||
-                formAnswers[formConfig.standardFields.address[1]] || '';
-        } else {
-            city = formAnswers['City'] || formAnswers['city'] || '';
-            address = formAnswers['Address'] || formAnswers['address'] || '';
+        if (!invitee || !eventData) {
+            console.log(`[${requestId}] ❌ Missing invitee or event data after normalization.`);
+            console.log(`[${requestId}] invitee present?`, !!invitee);
+            console.log(`[${requestId}] eventData present?`, !!eventData);
+            return res.status(200).json({ success: false, error: 'Missing invitee/event in payload' });
         }
 
-        // Build TeleForce payload
+        // Calendly event name (your segment naming)
+        const eventTitle = eventData.name || eventData?.event_type || '';
+        const segmentId = SEGMENT_MAPPING[eventTitle] || SEGMENT_MAPPING.default_segment;
+
+        console.log(`[${requestId}] Calendly eventTitle: "${eventTitle}"`);
+        console.log(`[${requestId}] Resolved segmentId: "${segmentId}"`);
+
+        // Parse form answers (array of {question, answer})
+        const formAnswers = {};
+        if (Array.isArray(questionsAnswers)) {
+            questionsAnswers.forEach((qa) => {
+                if (qa?.question) formAnswers[qa.question] = qa.answer;
+            });
+        }
+
+        console.log(`[${requestId}] questionsAnswers count: ${Array.isArray(questionsAnswers) ? questionsAnswers.length : 0}`);
+        console.log(`[${requestId}] formAnswers:`, formAnswers);
+
+        const fullName =
+            invitee.name ||
+            [invitee.first_name, invitee.last_name].filter(Boolean).join(' ') ||
+            'Unknown';
+
+        const email = invitee.email || '';
+        const mobile = invitee.text_reminder_number || invitee.phone_number || '';
+
+        const formConfig = FORM_MAPPINGS[eventTitle];
+
+        const city = formConfig
+            ? pickFirst(formAnswers, formConfig.standardFields.city)
+            : pickFirst(formAnswers, ['City', 'city']);
+
+        const address = formConfig
+            ? pickFirst(formAnswers, formConfig.standardFields.address)
+            : pickFirst(formAnswers, ['Address', 'address']);
+
         const teleforcePayload = {
             name: fullName,
-            email: email,
-            mobile: mobile,
-            city: city,
-            address: address,
+            email,
+            mobile,
+            city,
+            address,
             usergroupid: ACCOUNT_ID,
-            segmentid: segmentId || '',
+            segmentid: segmentId,
             otherparams: []
         };
 
-        // Add custom fields
-        questionsAnswers.forEach((qa) => {
-            const key = qa.question.replace(/\s+/g, '_');
-            const skipFields = ['City', 'city', 'Address', 'address'];
+        // push all Q/A to otherparams
+        if (Array.isArray(questionsAnswers)) {
+            questionsAnswers.forEach((qa) => {
+                if (!qa?.question) return;
 
-            if (!skipFields.includes(qa.question)) {
+                const skipFields = ['City', 'city', 'Address', 'address'];
+                if (skipFields.includes(qa.question)) return;
+
                 teleforcePayload.otherparams.push({
-                    meta_key: key,
-                    meta_value: qa.answer
+                    meta_key: qa.question.replace(/\s+/g, '_'),
+                    meta_value: qa.answer ?? ''
                 });
-            }
-        });
+            });
+        }
 
-        // Add metadata
+        // metadata
         teleforcePayload.otherparams.push(
-            {
-                meta_key: 'Segment_Name',
-                meta_value: eventTitle
-            },
-            {
-                meta_key: 'Scheduled_Time',
-                meta_value: eventData.start_time
-            },
-            {
-                meta_key: 'Timezone',
-                meta_value: invitee.timezone
-            }
+            { meta_key: 'Calendly_Event_Title', meta_value: eventTitle },
+            { meta_key: 'Calendly_Event_Start', meta_value: eventData.start_time || '' },
+            { meta_key: 'Calendly_Invitee_Email', meta_value: email },
+            { meta_key: 'Calendly_Invitee_Timezone', meta_value: invitee.timezone || '' }
         );
 
-        console.log('\n✅ Payload:', JSON.stringify(teleforcePayload, null, 2));
+        console.log(`\n[${requestId}] ✅ TELEFORCE PAYLOAD READY:`);
+        console.log(`[${requestId}] Teleforce URL: ${TELEFORCE_API_URL}`);
+        console.log(`[${requestId}] Payload: ${JSON.stringify(teleforcePayload, null, 2)}`);
 
         // Send to TeleForce
-        console.log(`🚀 Sending to TeleForce...`);
-
-        const response = await axios.post(TELEFORCE_API_URL, teleforcePayload, {
+        console.log(`[${requestId}] 🚀 Sending to TeleForce...`);
+        const tfResp = await axios.post(TELEFORCE_API_URL, teleforcePayload, {
             headers: { 'Content-Type': 'application/json' },
-            timeout: 10000
+            timeout: 15000
         });
 
-        console.log('✅ Success:', response.data);
+        console.log(`[${requestId}] ✅ TeleForce response status: ${tfResp.status}`);
+        console.log(`[${requestId}] ✅ TeleForce response body:`, JSON.stringify(tfResp.data, null, 2));
 
-        res.status(200).json({
+        return res.status(200).json({
             success: true,
             message: 'Lead sent to TeleForce',
-            segment: eventTitle
+            segment: eventTitle,
+            segmentid: segmentId
         });
-
     } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({
+        console.log(`\n==================== ERROR ====================`);
+        console.error(`❌ Webhook error:`, error.message);
+        if (error.response?.data) {
+            console.error(`❌ TeleForce/API error body:`, JSON.stringify(error.response.data, null, 2));
+        }
+        return res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message,
+            details: error.response?.data
         });
     }
 });
 
 // ============================================
-// REGISTER WEBHOOK WITH CALENDLY API
+// (OPTIONAL) REGISTER WEBHOOK WITH CALENDLY API
+// NOTE: You already registered it via curl.
+// Leaving this here if you want programmatic registration.
+// Calendly requires organization + scope when creating org-level subscriptions.
 // ============================================
 app.get('/register-webhook', async (req, res) => {
     try {
         const webhookUrl = req.query.url;
+        const organization = req.query.organization; // pass your org url here
+        const scope = req.query.scope || 'organization';
 
-        if (!webhookUrl) {
-            return res.status(400).json({ error: 'URL parameter required' });
+        if (!webhookUrl || !organization) {
+            return res.status(400).json({
+                error: 'Missing params',
+                required: {
+                    url: 'https://your-service.onrender.com/api/webhook',
+                    organization: 'https://api.calendly.com/organizations/XXXX'
+                }
+            });
         }
 
         console.log(`\n🔗 Registering webhook: ${webhookUrl}`);
+        console.log(`🏢 Organization: ${organization}`);
+        console.log(`🔒 Scope: ${scope}`);
 
         const response = await axios.post(
             'https://api.calendly.com/webhook_subscriptions',
             {
                 url: webhookUrl,
-                events: ['invitee.created']
+                events: ['invitee.created'],
+                organization,
+                scope
             },
             {
                 headers: {
-                    'Authorization': `Bearer ${CALENDLY_TOKEN}`,
+                    Authorization: `Bearer ${CALENDLY_TOKEN}`,
                     'Content-Type': 'application/json'
                 }
             }
         );
 
-        console.log('✅ Webhook registered:', response.data);
+        console.log('✅ Webhook registered:', JSON.stringify(response.data, null, 2));
 
         res.status(200).json({
             success: true,
             message: 'Webhook registered in Calendly',
             data: response.data
         });
-
     } catch (error) {
         console.error('❌ Registration error:', error.message);
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             error: error.message,
             details: error.response?.data
@@ -208,9 +358,10 @@ app.get('/register-webhook', async (req, res) => {
 // START SERVER
 // ============================================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-    console.log(`\n🎯 Server running on http://localhost:${PORT}`);
-    console.log(`📍 Webhook endpoint: http://localhost:${PORT}/api/webhook`);
-    console.log(`🔗 Register webhook: http://localhost:${PORT}/register-webhook?url=YOUR_PUBLIC_URL`);
+    console.log(`\n🎯 Server started`);
+    console.log(`✅ Listening on port: ${PORT}`);
+    console.log(`📍 Webhook endpoint: /api/webhook`);
+    console.log(`🔗 Health: /health`);
+    console.log(`🧪 Signature verify: ${ENABLE_SIGNATURE_VERIFY ? 'ENABLED' : 'DISABLED'}`);
 });
