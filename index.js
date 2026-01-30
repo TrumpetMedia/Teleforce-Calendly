@@ -24,7 +24,7 @@ console.log('TELEFORCE_API_URL:', TELEFORCE_API_URL);
 console.log('ACCOUNT_ID:', ACCOUNT_ID ? 'OK' : '❌ MISSING');
 console.log('CALENDLY_TOKEN:', CALENDLY_TOKEN ? 'OK' : '❌ MISSING');
 
-// ===================== SEGMENTS (FULL) =====================
+// ===================== SEGMENTS =====================
 const SEGMENT_MAPPING = {
     CRO: 'SEG07ootjebf6hm231767941287541',
     Performance: 'SEGtgewk86jmjb31767941272012',
@@ -49,23 +49,15 @@ function normalizeMobile(input) {
 
     let digits = String(input).replace(/\D/g, '');
 
-    // India number with country code → strip 91
     if (digits.length === 12 && digits.startsWith('91')) {
         digits = digits.slice(2);
     }
 
-    // If still longer than 10, take last 10
     if (digits.length > 10) {
         digits = digits.slice(-10);
     }
 
-    // Final validation
-    if (digits.length !== 10) {
-        console.warn('⚠️ Invalid mobile after normalization:', input, digits);
-        return '';
-    }
-
-    return digits;
+    return digits.length === 10 ? digits : '';
 }
 
 function qaMap(list = []) {
@@ -114,16 +106,6 @@ function resolveSegment(eventTypeName, utm, requestId) {
     if (name.includes('cro')) segmentKey = 'CRO';
     else if (name.includes('performance')) segmentKey = 'Performance';
     else if (name.includes('partner')) segmentKey = 'Partner';
-    else {
-        const hasUTM =
-            utm &&
-            (utm.utm_source ||
-                utm.utm_medium ||
-                utm.utm_campaign ||
-                utm.utm_term ||
-                utm.utm_content);
-        segmentKey = hasUTM ? 'Direct' : 'Direct';
-    }
 
     const segmentId = SEGMENT_MAPPING[segmentKey];
 
@@ -153,15 +135,19 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
             return res.status(200).json({ ignored: true });
         }
 
-        const payload = body.payload;
-        const qa = qaMap(payload.questions_and_answers || []);
+        const payload = body.payload || {};
+        const questionsAnswers = payload.questions_and_answers || [];
+        const qa = qaMap(questionsAnswers);
         const utm = payload.tracking || {};
 
         const fullName = payload.name || '';
         const email = payload.email || '';
-        const mobile = normalizeMobile(pick(qa, ['mobile', 'phone', 'whatsapp']));
 
-        console.log(`[${requestId}] 👤 Lead`, { fullName, email, mobile });
+        const rawMobile = pick(qa, ['mobile', 'phone', 'whatsapp']);
+        const mobile = normalizeMobile(rawMobile);
+        const mobileSafe = mobile || '';
+
+        console.log(`[${requestId}] 👤 Lead`, { fullName, email, mobile: mobileSafe });
 
         const city = pick(qa, ['city']);
         const address = pick(qa, ['address']);
@@ -178,10 +164,28 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
             requestId
         );
 
-        const { segmentKey, segmentId } = resolveSegment(
-            eventTypeName,
-            utm,
-            requestId
+        const { segmentId } = resolveSegment(eventTypeName, utm, requestId);
+
+        // ===================== OTHERPARAMS =====================
+        const otherparams = [];
+
+        questionsAnswers.forEach(q => {
+            if (!q?.question) return;
+
+            otherparams.push({
+                meta_key: q.question
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '_')
+                    .replace(/^_|_$/g, ''),
+                meta_value: q.answer ?? ''
+            });
+        });
+
+        otherparams.push(
+            { meta_key: 'company_name', meta_value: companyName },
+            { meta_key: 'website', meta_value: website },
+            { meta_key: 'ads_name', meta_value: adsName },
+            { meta_key: 'ads_id', meta_value: adsId }
         );
 
         // ===================== TELEFORCE PAYLOAD =====================
@@ -196,12 +200,7 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
             usergroupid: ACCOUNT_ID,
             segmentid: segmentId,
 
-            otherparams: [
-                { meta_key: 'company_name', meta_value: companyName },
-                { meta_key: 'website', meta_value: website },
-                { meta_key: 'ads_name', meta_value: adsName },
-                { meta_key: 'ads_id', meta_value: adsId }
-            ]
+            otherparams
         };
 
         console.log(`[${requestId}] 📦 TELEFORCE PAYLOAD`);
