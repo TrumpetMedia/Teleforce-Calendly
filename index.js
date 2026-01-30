@@ -175,18 +175,27 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
         // ===================== TELEFORCE PAYLOAD =====================
         const teleforcePayload = {
-            name: fullName,
-            email,
-            mobile,
-            city,
-            address,
-            company_name: companyName,   // ✅ FIXED
-            website: website,             // ✅ FIXED
-            ads_name: adsName,             // ✅ FIXED
-            ads_id: adsId,                 // ✅ FIXED
-            source: 'Calendly',
+            // 🔑 Identity (MANDATORY)
+            lead_name: fullName,
+            lead_email: email,
+            lead_mobile: mobile,
+
+            // 🔑 Classification
+            segment_name: segmentKey,   // CRO / Performance / Partner
+            lead_source: 'Calendly',
+
+            // 🔑 Business fields (now WILL map)
+            address: address || '',
+            company_name: companyName || '',
+            website: website || '',
+            ads_name: adsName || '',
+            ads_id: adsId || '',
+
+            // 🔑 Required system fields
             usergroupid: ACCOUNT_ID,
             segmentid: segmentId,
+
+            // Optional
             otherparams: []
         };
 
