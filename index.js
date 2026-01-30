@@ -7,7 +7,7 @@ const app = express();
 
 /**
  * Keep JSON parsing for normal routes.
- * Use RAW body for webhook route only (so logs are exact and signature verification can be added later).
+ * Use RAW body for webhook route only.
  */
 app.use((req, res, next) => {
     if (req.path === '/api/webhook') return next();
@@ -25,12 +25,6 @@ const SEGMENT_MAPPING = {
     default_segment: 'SEGplj45zsru74b1767770566946'
 };
 
-// ===================== FORM FIELD MAPPING =====================
-const FORM_MAPPINGS = {
-    CRO: { standardFields: { city: ['City', 'city'], address: ['Address', 'address'] } },
-    Performance: { standardFields: { city: ['City', 'city'], address: ['Address', 'address'] } }
-};
-
 // ===================== HEALTH =====================
 app.get('/health', (req, res) => res.status(200).json({ status: 'OK' }));
 
@@ -43,98 +37,91 @@ function safeJsonParse(buf) {
     }
 }
 
-function pickFirst(formAnswers, keys = []) {
-    for (const k of keys) {
-        const v = formAnswers?.[k];
-        if (v !== undefined && v !== null && String(v).trim() !== '') return v;
-    }
-    return '';
-}
-
-/**
- * Calendly invitee.created payload (what your logs show):
- * body.payload has invitee info directly: name, email, questions_and_answers...
- * body.payload.scheduled_event has event info including event_type (URL).
- */
 function normalizeMobile(input) {
     if (!input) return '';
-
-    // keep digits only
     let digits = String(input).replace(/\D/g, '');
-
-    // If it looks like India number with country code (91 + 10 digits)
     if (digits.length === 12 && digits.startsWith('91')) return digits;
-
-    // If it's already 10 digits
     if (digits.length === 10) return digits;
-
-    // Otherwise fallback: last 10 digits
     if (digits.length > 10) return digits.slice(-10);
-
-    return digits; // may still fail but at least clean
+    return digits;
 }
 
 function normalizeCalendlyWebhook(body) {
     const event = body?.event;
     const payload = body?.payload;
-
-    // For invitee.created: payload itself is effectively the invitee resource
-    const invitee = payload || null;
-
-    // scheduled_event object is inside payload
-    const eventData = payload?.scheduled_event || null;
-
-    const questionsAnswers = payload?.questions_and_answers || [];
-
-    return { event, invitee, eventData, questionsAnswers, raw: body };
+    return {
+        event,
+        invitee: payload || null,
+        eventData: payload?.scheduled_event || null,
+        questionsAnswers: payload?.questions_and_answers || [],
+        utm: payload?.tracking || {}
+    };
 }
 
-/**
- * Fetch Calendly Event Type name from the event_type URL
- * Example event_type URL:
- * https://api.calendly.com/event_types/XXXX
- */
-async function getEventTypeName(eventTypeUrl, requestId) {
+async function getEventTypeName(eventTypeUrl) {
+    if (!eventTypeUrl) return null;
     try {
-        if (!eventTypeUrl) return null;
-        console.log(`[${requestId}] 🔎 Fetching event type name from: ${eventTypeUrl}`);
-
         const resp = await axios.get(eventTypeUrl, {
             headers: { Authorization: `Bearer ${CALENDLY_TOKEN}` },
             timeout: 15000
         });
-
-        const name = resp.data?.resource?.name || null;
-        console.log(`[${requestId}] ✅ Event type name resolved: ${name}`);
-        return name;
-    } catch (err) {
-        console.log(`[${requestId}] ❌ Failed to fetch event type name: ${err.message}`);
-        if (err.response?.data) {
-            console.log(`[${requestId}] Calendly error body: ${JSON.stringify(err.response.data).slice(0, 1200)}`);
-        }
+        return resp.data?.resource?.name || null;
+    } catch {
         return null;
     }
 }
 
-/**
- * Decide TeleForce segment based on Calendly event type name.
- * Your event names are like:
- * - "Website CRO Meet"  -> segment CRO
- * - "Performance marketing ..." -> segment Performance
- */
-function resolveSegment(eventTypeName, requestId) {
+function resolveSegment({ eventTypeName, utm }, requestId) {
     const name = (eventTypeName || '').toLowerCase();
 
-    let segmentKey = null;
-    if (name.includes('cro')) segmentKey = 'CRO';
-    else if (name.includes('performance')) segmentKey = 'Performance';
+    let segmentKey = 'Direct'; // default
 
-    const segmentId = SEGMENT_MAPPING[segmentKey] || SEGMENT_MAPPING.default_segment;
+    if (name.includes('cro')) {
+        segmentKey = 'CRO';
+    } else if (name.includes('performance')) {
+        segmentKey = 'Performance';
+    } else if (name.includes('partner')) {
+        segmentKey = 'Partner';
+    } else {
+        // No clear event type → check UTM
+        const hasUTM =
+            utm &&
+            (utm.utm_source ||
+                utm.utm_medium ||
+                utm.utm_campaign ||
+                utm.utm_term ||
+                utm.utm_content);
 
-    console.log(`[${requestId}] 🧩 Segment resolution:`);
-    console.log(`[${requestId}] eventTypeName="${eventTypeName}" => segmentKey="${segmentKey}" => segmentId="${segmentId}"`);
+        segmentKey = hasUTM ? 'Direct' : 'Direct';
+    }
 
-    return { segmentKey: segmentKey || 'default_segment', segmentId };
+    const segmentId = SEGMENT_MAPPING[segmentKey];
+
+    console.log(`[${requestId}] 🧩 SEGMENT DECISION`);
+    console.log(`[${requestId}] EventType="${eventTypeName}"`);
+    console.log(`[${requestId}] UTM=`, utm || {});
+    console.log(`[${requestId}] → Segment="${segmentKey}" (${segmentId})`);
+
+    return { segmentKey, segmentId };
+}
+
+
+function qaMap(questionsAnswers) {
+    const map = {};
+    questionsAnswers.forEach(q => {
+        if (!q?.question) return;
+        map[q.question.toLowerCase().trim()] = q.answer;
+    });
+    return map;
+}
+
+function pick(map, patterns = []) {
+    for (const p of patterns) {
+        for (const key of Object.keys(map)) {
+            if (key.includes(p)) return map[key];
+        }
+    }
+    return '';
 }
 
 // ===================== WEBHOOK =====================
@@ -142,145 +129,107 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     const requestId = crypto.randomUUID();
 
     try {
-        const rawBody = req.body?.toString('utf8') || '';
-        console.log(`\n==================== [${requestId}] WEBHOOK HIT ====================`);
-        console.log(`[${requestId}] Time: ${new Date().toISOString()}`);
-        console.log(`[${requestId}] Headers:`, {
-            'content-type': req.headers['content-type'],
-            'user-agent': req.headers['user-agent']
-        });
-        console.log(`[${requestId}] Raw body length: ${rawBody.length}`);
-
         const body = safeJsonParse(req.body);
-        if (!body) {
-            console.log(`[${requestId}] ❌ Invalid JSON received`);
-            return res.status(400).json({ success: false, error: 'Invalid JSON body' });
-        }
+        if (!body) return res.status(400).json({ success: false });
 
-        console.log(`[${requestId}] Parsed body keys:`, Object.keys(body));
-        console.log(`[${requestId}] Body preview:`, JSON.stringify(body, null, 2).slice(0, 2500));
+        const { event, invitee, eventData, questionsAnswers, utm } =
+            normalizeCalendlyWebhook(body);
 
-        const { event, invitee, eventData, questionsAnswers } = normalizeCalendlyWebhook(body);
-
-        console.log(`[${requestId}] Event type: ${event}`);
         if (event !== 'invitee.created') {
-            console.log(`[${requestId}] Ignoring event type: ${event}`);
-            return res.status(200).json({ message: 'Event ignored' });
+            return res.status(200).json({ ignored: true });
         }
 
-        if (!invitee) {
-            console.log(`[${requestId}] ❌ Missing invitee after normalization`);
-            return res.status(200).json({ success: false, error: 'Missing invitee in payload' });
-        }
+        const qa = qaMap(questionsAnswers);
 
-        if (!eventData) {
-            console.log(`[${requestId}] ❌ Missing scheduled_event after normalization`);
-            return res.status(200).json({ success: false, error: 'Missing scheduled_event in payload' });
-        }
-
-        // invitee fields (from payload)
         const fullName = invitee.name || 'Unknown';
         const email = invitee.email || '';
-        const rawMobile =
-            questionsAnswers.find(q => (q.question || '').toLowerCase().includes('mobile'))?.answer || '';
 
+        const rawMobile = pick(qa, ['mobile', 'phone', 'whatsapp', 'contact']);
         const mobile = normalizeMobile(rawMobile);
 
-        console.log(`[${requestId}] Mobile raw="${rawMobile}" normalized="${mobile}"`);
+        const city = pick(qa, ['city']);
+        const address = pick(qa, ['address']);
 
-        console.log(`[${requestId}] Invitee parsed: name="${fullName}", email="${email}", mobile="${mobile}"`);
+        const companyName = pick(qa, ['company']);
+        const website = pick(qa, ['website']);
 
-        // resolve event type name (needed for segment mapping)
-        const eventTypeUrl = eventData.event_type; // URL string
-        const eventTypeName = await getEventTypeName(eventTypeUrl, requestId);
+        // Ads / UTM mapping
+        const adsName =
+            utm?.utm_campaign ||
+            pick(qa, ['campaign', 'ads']);
 
-        const { segmentKey, segmentId } = resolveSegment(eventTypeName, requestId);
+        const adsId =
+            utm?.utm_term ||
+            utm?.utm_content ||
+            '';
 
-        // parse Q/A into map
-        const formAnswers = {};
-        if (Array.isArray(questionsAnswers)) {
-            questionsAnswers.forEach((qa) => {
-                if (qa?.question) formAnswers[qa.question] = qa.answer;
-            });
-        }
+        const eventTypeName = await getEventTypeName(eventData.event_type);
 
-        console.log(`[${requestId}] questionsAnswers count: ${Array.isArray(questionsAnswers) ? questionsAnswers.length : 0}`);
+        const { segmentKey, segmentId } = resolveSegment(
+            {
+                eventTypeName,
+                utm
+            },
+            requestId
+        );
 
-        // city/address if present in Q/A (optional)
-        const formConfig = FORM_MAPPINGS[segmentKey]; // map by segment key
-        const city = formConfig ? pickFirst(formAnswers, formConfig.standardFields.city) : pickFirst(formAnswers, ['City', 'city']);
-        const address = formConfig ? pickFirst(formAnswers, formConfig.standardFields.address) : pickFirst(formAnswers, ['Address', 'address']);
-
-        // Build TeleForce payload
+        // ===================== TELEFORCE PAYLOAD =====================
         const teleforcePayload = {
             name: fullName,
             email,
             mobile,
             city,
             address,
+            company_name: companyName,   // ✅ FIXED
+            website: website,             // ✅ FIXED
+            ads_name: adsName,             // ✅ FIXED
+            ads_id: adsId,                 // ✅ FIXED
+            source: 'Calendly',
             usergroupid: ACCOUNT_ID,
             segmentid: segmentId,
             otherparams: []
         };
 
-        // Push all Q/A as otherparams (keep everything)
-        if (Array.isArray(questionsAnswers)) {
-            questionsAnswers.forEach((qa) => {
-                if (!qa?.question) return;
-                teleforcePayload.otherparams.push({
-                    meta_key: qa.question.replace(/\s+/g, '_'),
-                    meta_value: qa.answer ?? ''
-                });
+        // Push ALL Q/A to custom fields (for safety)
+        questionsAnswers.forEach(q => {
+            if (!q?.question) return;
+            teleforcePayload.otherparams.push({
+                meta_key: q.question
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '_')
+                    .replace(/^_|_$/g, ''),
+                meta_value: q.answer ?? ''
             });
-        }
+        });
 
-        // Add Calendly metadata
+        // Calendly metadata
         teleforcePayload.otherparams.push(
-            { meta_key: 'Calendly_EventType_Name', meta_value: eventTypeName || '' },
-            { meta_key: 'Calendly_ScheduledEvent_URI', meta_value: eventData.uri || '' },
-            { meta_key: 'Calendly_Scheduled_Start', meta_value: eventData.start_time || '' },
-            { meta_key: 'Calendly_Scheduled_End', meta_value: eventData.end_time || '' }
+            { meta_key: 'calendly_eventtype_name', meta_value: eventTypeName || '' },
+            { meta_key: 'calendly_scheduled_start', meta_value: eventData.start_time || '' },
+            { meta_key: 'calendly_scheduled_end', meta_value: eventData.end_time || '' },
+            { meta_key: 'calendly_scheduledevent_uri', meta_value: eventData.uri || '' }
         );
 
-        console.log(`\n[${requestId}] ✅ TELEFORCE PAYLOAD:`);
-        console.log(`[${requestId}] URL: ${TELEFORCE_API_URL}`);
-        console.log(`[${requestId}] Payload: ${JSON.stringify(teleforcePayload, null, 2)}`);
-
-        // Send to TeleForce
-        console.log(`[${requestId}] 🚀 Sending to TeleForce...`);
-        const tfResp = await axios.post(TELEFORCE_API_URL, teleforcePayload, {
+        await axios.post(TELEFORCE_API_URL, teleforcePayload, {
             headers: { 'Content-Type': 'application/json' },
             timeout: 15000
         });
 
-        console.log(`[${requestId}] ✅ TeleForce status: ${tfResp.status}`);
-        console.log(`[${requestId}] ✅ TeleForce body: ${JSON.stringify(tfResp.data, null, 2)}`);
-
         return res.status(200).json({
             success: true,
-            message: 'Lead sent to TeleForce',
             segmentKey,
-            segmentid: segmentId
+            segmentId
         });
-    } catch (error) {
-        console.log(`\n==================== [${requestId}] ERROR ====================`);
-        console.error(`[${requestId}] ❌ Error:`, error.message);
-        if (error.response?.data) {
-            console.error(`[${requestId}] ❌ API error body:`, JSON.stringify(error.response.data, null, 2));
-        }
-        return res.status(500).json({
-            success: false,
-            error: error.message,
-            details: error.response?.data
-        });
+
+    } catch (err) {
+        console.error(err.message);
+        // Always ACK Calendly
+        return res.status(200).json({ success: false });
     }
 });
 
 // ===================== START =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`\n🎯 Server started`);
-    console.log(`✅ Listening on port: ${PORT}`);
-    console.log(`📍 Webhook endpoint: /api/webhook`);
-    console.log(`🔗 Health: /health`);
+    console.log(`✅ Server running on port ${PORT}`);
 });
