@@ -186,24 +186,22 @@ app.post('/api/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
         // ===================== TELEFORCE PAYLOAD =====================
         const teleforcePayload = {
-            lead_name: fullName,
-            lead_email: email,
-            lead_mobile: mobile,
+            name: fullName,
+            email,
+            mobile: mobileSafe,
 
-            segment_name: segmentKey,
-            lead_source: 'Calendly',
-
-            city: city || '',
-            address: address || '',
-            company_name: companyName || '',
-            website: website || '',
-            ads_name: adsName || '',
-            ads_id: adsId || '',
+            city,
+            address,
 
             usergroupid: ACCOUNT_ID,
             segmentid: segmentId,
 
-            otherparams: []
+            otherparams: [
+                { meta_key: 'company_name', meta_value: companyName },
+                { meta_key: 'website', meta_value: website },
+                { meta_key: 'ads_name', meta_value: adsName },
+                { meta_key: 'ads_id', meta_value: adsId }
+            ]
         };
 
         console.log(`[${requestId}] 📦 TELEFORCE PAYLOAD`);
