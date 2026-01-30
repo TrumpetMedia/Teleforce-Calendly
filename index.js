@@ -46,10 +46,26 @@ function safeJsonParse(buf) {
 
 function normalizeMobile(input) {
     if (!input) return '';
-    const d = String(input).replace(/\D/g, '');
-    if (d.length === 12 && d.startsWith('91')) return d;
-    if (d.length === 10) return d;
-    return d.slice(-10);
+
+    let digits = String(input).replace(/\D/g, '');
+
+    // India number with country code → strip 91
+    if (digits.length === 12 && digits.startsWith('91')) {
+        digits = digits.slice(2);
+    }
+
+    // If still longer than 10, take last 10
+    if (digits.length > 10) {
+        digits = digits.slice(-10);
+    }
+
+    // Final validation
+    if (digits.length !== 10) {
+        console.warn('⚠️ Invalid mobile after normalization:', input, digits);
+        return '';
+    }
+
+    return digits;
 }
 
 function qaMap(list = []) {
